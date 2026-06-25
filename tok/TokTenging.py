@@ -124,6 +124,7 @@ except ImportError:
 
 ui_components.configure_drag_and_drop(TKDND_AVAILABLE, DND_FILES)
 ui_components.set_layout_refresh_callback(lambda: schedule_layout_refresh())
+THEMES = ui_components.THEMES
 globals().update(ui_components.get_theme("light"))
 
 # Settings layout helpers
