@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+dist_*/
+*.egg-info/
+
+# Local app/runtime output
+*.log
+*.backup.py
+*.codex-current.py
+tok/trainingCoded/
+tok/trainingRaw/
+tok/special cases do not touch/
+
+# Private source documents and exports
+*.xlsx
+*.xls
+*.xlsm
+*.pdf
+*.zip
+
+# Node/tooling caches from experiments
+node_modules/
+package-lock.json
