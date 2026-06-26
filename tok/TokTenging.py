@@ -3,12 +3,10 @@ from tkinter import ttk, filedialog, PhotoImage
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     TKDND_AVAILABLE = True
-    TKDND_ERROR = ""
-except Exception as exc:
+except Exception:
     DND_FILES = None
     TkinterDnD = None
     TKDND_AVAILABLE = False
-    TKDND_ERROR = str(exc)
 import pandas as pd
 import pyautogui
 import time
@@ -27,26 +25,19 @@ from threading import Timer
 
 try:
     try:
-        from .auto_coder import apply_auto_debit_codes, get_auto_coder
+        from .auto_coder import get_auto_coder
     except ImportError:
-        from auto_coder import apply_auto_debit_codes, get_auto_coder
+        from auto_coder import get_auto_coder
     AUTO_CODER_AVAILABLE = True
     AUTO_CODER_ERROR = ""
 except Exception as exc:
-    apply_auto_debit_codes = None
     get_auto_coder = None
     AUTO_CODER_AVAILABLE = False
     AUTO_CODER_ERROR = str(exc)
 
-action_delay = 0.1
-focus_delay = 0.02
-paste_delay = 0.0
-post_paste_delay = 0.02
-start_delay = 3
-running = True
-watchdog_timer = None
-after_id = None
 settings = {}
+runtime_timing = {}
+automation_state = {"active": False, "watchdog": None, "after": None, "stop_reason": ""}
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), "AppData", "Local", "TokTenging", "settings.json")
 DEBUG_LOG_PATH = os.path.join(os.path.dirname(SETTINGS_PATH), "tok_input_debug.log")
 pending_tok_df = None
@@ -54,7 +45,6 @@ pending_tok_file_path = None
 current_tok_file_path = None
 current_tok_run_start_index = 0
 current_run_speed_label = "Saved"
-automation_stop_reason = ""
 AUTOMATION_WATCHDOG_SECONDS = 15
 MOUSE_FAILSAFE_MARGIN = 8
 RECENT_FILE_LIMIT = 5
@@ -72,7 +62,7 @@ SPEED_PRESET_MAP["Test Run"] = {"action": 3.0, "focus": 1.0, "paste": 3.0, "post
 pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = True
 
-# Sentinel used by the action queue to mean "use the current global action_delay".
+# Sentinel used by the action queue to mean "use the current action delay".
 USE_ACTION_DELAY = object()
 
 # =============================================================================
@@ -88,16 +78,13 @@ try:
         attach_drop_target,
         create_drop_box,
         create_panel,
-        create_segmented_setting,
         create_styled_button,
         create_styled_entry,
         create_styled_label,
         create_styled_text_area,
-        finalize_fixed_action_dialog_grid,
         get_text_area_value,
         set_button_accent,
         set_text_area_value,
-        _rounded_rect,
     )
 except ImportError:
     import bank_formatter
@@ -110,16 +97,13 @@ except ImportError:
         attach_drop_target,
         create_drop_box,
         create_panel,
-        create_segmented_setting,
         create_styled_button,
         create_styled_entry,
         create_styled_label,
         create_styled_text_area,
-        finalize_fixed_action_dialog_grid,
         get_text_area_value,
         set_button_accent,
         set_text_area_value,
-        _rounded_rect,
     )
 
 ui_components.configure_drag_and_drop(TKDND_AVAILABLE, DND_FILES)
@@ -401,6 +385,33 @@ def save_settings():
     except Exception:
         pass
 
+def _timing_value(setting_key, fallback, integer=False):
+    value = runtime_timing.get(setting_key, settings.get(setting_key, fallback))
+    try:
+        value = float(value)
+    except Exception:
+        value = fallback
+    return int(value) if integer else value
+
+def _set_timing_value(setting_key, value, fallback, integer=False, persist=True):
+    try:
+        value = float(value)
+    except Exception:
+        value = fallback
+    if integer:
+        value = int(value)
+    runtime_timing[setting_key] = value
+    if persist:
+        settings[setting_key] = value
+    return value
+
+def _sync_runtime_timing_from_settings():
+    _set_timing_value("action_delay", settings.get("action_delay", 0.1), 0.1)
+    _set_timing_value("focus_delay", settings.get("focus_delay", 0.05), 0.05)
+    _set_timing_value("paste_delay", settings.get("paste_delay", 0.0), 0.0)
+    _set_timing_value("post_paste_delay", settings.get("post_paste_delay", 0.05), 0.05)
+    _set_timing_value("start_delay", settings.get("start_delay", 3), 3, integer=True)
+
 def _after_ms(seconds):
     # Tkinter expects milliseconds. Always schedule at least 1ms.
     try:
@@ -409,28 +420,34 @@ def _after_ms(seconds):
         return 1
 
 def _cancel_scheduled_after():
-    global after_id
-    if after_id is not None:
+    current_after_id = automation_state.get("after")
+    if current_after_id is not None:
         try:
-            root.after_cancel(after_id)
+            root.after_cancel(current_after_id)
         except Exception:
             pass
-        after_id = None
+        automation_state["after"] = None
 
 def _cancel_watchdog():
-    global watchdog_timer
-    if watchdog_timer:
+    current_watchdog = automation_state.get("watchdog")
+    if current_watchdog:
         try:
-            watchdog_timer.cancel()
+            current_watchdog.cancel()
         except Exception:
             pass
-    watchdog_timer = None
+    automation_state["watchdog"] = None
 
 def _mark_automation_stopped(reason=""):
-    global running, actions, automation_stop_reason
-    running = False
+    global actions
+    automation_state["active"] = False
     actions = []
-    automation_stop_reason = reason
+    automation_state["stop_reason"] = reason
+
+def _automation_is_running():
+    return bool(automation_state.get("active"))
+
+def _automation_stop_reason():
+    return automation_state.get("stop_reason", "")
 
 def _mouse_in_main_top_left():
     try:
@@ -445,48 +462,26 @@ def _stop_for_mouse_failsafe():
     _cancel_watchdog()
 
 def _arm_watchdog():
-    global watchdog_timer
     _cancel_watchdog()
-    watchdog_timer = Timer(AUTOMATION_WATCHDOG_SECONDS, on_watchdog_timeout)
-    watchdog_timer.daemon = True
-    watchdog_timer.start()
+    automation_state["watchdog"] = Timer(AUTOMATION_WATCHDOG_SECONDS, on_watchdog_timeout)
+    automation_state["watchdog"].daemon = True
+    automation_state["watchdog"].start()
 
 def _sync_settings_from_ui():
-    global action_delay, start_delay, focus_delay, paste_delay, post_paste_delay
     if "settings_theme_var" in globals():
         theme = settings_theme_var.get()
         if theme in THEMES:
             settings["theme"] = theme
     if "settings_action_entry" in globals() and settings_action_entry and settings_action_entry.winfo_exists():
-        try:
-            action_delay = float(settings_action_entry.get())
-        except Exception:
-            pass
-        settings["action_delay"] = action_delay
+        _set_timing_value("action_delay", settings_action_entry.get(), _timing_value("action_delay", 0.1))
     if "settings_focus_entry" in globals() and settings_focus_entry and settings_focus_entry.winfo_exists():
-        try:
-            focus_delay = float(settings_focus_entry.get())
-        except Exception:
-            pass
-        settings["focus_delay"] = focus_delay
+        _set_timing_value("focus_delay", settings_focus_entry.get(), _timing_value("focus_delay", 0.05))
     if "settings_paste_entry" in globals() and settings_paste_entry and settings_paste_entry.winfo_exists():
-        try:
-            paste_delay = float(settings_paste_entry.get())
-        except Exception:
-            pass
-        settings["paste_delay"] = paste_delay
+        _set_timing_value("paste_delay", settings_paste_entry.get(), _timing_value("paste_delay", 0.0))
     if "settings_post_paste_entry" in globals() and settings_post_paste_entry and settings_post_paste_entry.winfo_exists():
-        try:
-            post_paste_delay = float(settings_post_paste_entry.get())
-        except Exception:
-            pass
-        settings["post_paste_delay"] = post_paste_delay
+        _set_timing_value("post_paste_delay", settings_post_paste_entry.get(), _timing_value("post_paste_delay", 0.05))
     if "settings_start_entry" in globals() and settings_start_entry and settings_start_entry.winfo_exists():
-        try:
-            start_delay = int(float(settings_start_entry.get()))
-        except Exception:
-            pass
-        settings["start_delay"] = start_delay
+        _set_timing_value("start_delay", settings_start_entry.get(), _timing_value("start_delay", 3, integer=True), integer=True)
     if "settings_output_dir_entry" in globals() and settings_output_dir_entry and settings_output_dir_entry.winfo_exists():
         output_dir = settings_output_dir_entry.get().strip()
         if output_dir:
@@ -502,14 +497,14 @@ def _sync_settings_from_ui():
     save_settings()
 
 def _set_runtime_delays(values):
-    global action_delay, focus_delay, paste_delay, post_paste_delay
-    action_delay = float(values.get("action", action_delay))
-    focus_delay = float(values.get("focus", focus_delay))
-    paste_delay = float(values.get("paste", paste_delay))
-    post_paste_delay = float(values.get("post_paste", post_paste_delay))
+    _set_timing_value("action_delay", values.get("action"), _timing_value("action_delay", 0.1), persist=False)
+    _set_timing_value("focus_delay", values.get("focus"), _timing_value("focus_delay", 0.05), persist=False)
+    _set_timing_value("paste_delay", values.get("paste"), _timing_value("paste_delay", 0.0), persist=False)
+    _set_timing_value("post_paste_delay", values.get("post_paste"), _timing_value("post_paste_delay", 0.05), persist=False)
+    _set_timing_value("start_delay", values.get("start"), _timing_value("start_delay", 3, integer=True), integer=True, persist=False)
 
 def apply_tok_run_speed_selection():
-    global action_delay, focus_delay, paste_delay, post_paste_delay, current_run_speed_label
+    global current_run_speed_label
     selected = "Saved"
     if "tok_run_speed_var" in globals() and tok_run_speed_var:
         selected = tok_run_speed_var.get() or "Saved"
@@ -517,10 +512,7 @@ def apply_tok_run_speed_selection():
     if selected in SPEED_PRESET_MAP:
         _set_runtime_delays(SPEED_PRESET_MAP[selected])
     else:
-        action_delay = float(settings.get("action_delay", action_delay))
-        focus_delay = float(settings.get("focus_delay", focus_delay))
-        paste_delay = float(settings.get("paste_delay", paste_delay))
-        post_paste_delay = float(settings.get("post_paste_delay", post_paste_delay))
+        _sync_runtime_timing_from_settings()
 
 def ensure_window_fits():
     root.update_idletasks()
@@ -605,97 +597,6 @@ def stop_script():
     _stop_automation_only()
     logging.info("Stopping...")
     display_stopped_screen()
-
-def _legacy_display_stopped_screen(reason=""):
-    """Legacy stopped screen kept only as a fallback reference."""
-    for widget in frame.winfo_children():
-        widget.destroy()
-    set_page_title("Script Stopped", TEXT_ERROR)
-    
-    # Calculate runtime
-    end_time = datetime.datetime.now()
-    time_elapsed = end_time - start_time if 'start_time' in globals() and start_time else datetime.timedelta(0)
-    
-    # Get current row info
-    current_row_num = row_index + 1 if 'row_index' in globals() else 0
-    if 'rows' in globals() and rows:
-        total_rows_count = len(rows)
-    elif pending_tok_df is not None:
-        total_rows_count = len(pending_tok_df)
-    else:
-        total_rows_count = 0
-    
-    if reason:
-        reason_label = create_styled_label(frame, reason, size=9, color=TEXT_WARNING)
-        reason_label.pack(pady=(0, 8))
-    
-    # Info card
-    card = tk.Frame(frame, bg=BG_CARD, padx=20, pady=15)
-    card.pack(fill=tk.X, padx=20, pady=10)
-    
-    # Row info
-    row_info_label = tk.Label(card, text=f"Stopped at Row: {current_row_num} / {total_rows_count}",
-                              bg=BG_CARD, fg=TEXT_PRIMARY, font=('Segoe UI', 11, 'bold'))
-    row_info_label.pack(pady=5)
-    
-    # Show current row details if available (truncate long text)
-    if 'rows' in globals() and rows and row_index < len(rows):
-        current_row = rows[row_index]
-        date_val = str(current_row.get('DATE', 'N/A'))
-        text_val = str(current_row.get('TEXT', 'N/A'))[:30] + ('...' if len(str(current_row.get('TEXT', ''))) > 30 else '')
-        amount_val = str(current_row.get('AMOUNT', 'N/A'))
-        
-        details_frame = tk.Frame(card, bg=BG_CARD)
-        details_frame.pack(pady=10)
-        
-        for label, value in [("DATE", date_val), ("TEXT", text_val), ("AMOUNT", amount_val)]:
-            row_frame = tk.Frame(details_frame, bg=BG_CARD)
-            row_frame.pack(fill=tk.X, pady=2)
-            tk.Label(row_frame, text=f"{label}:", bg=BG_CARD, fg=TEXT_SECONDARY,
-                    font=('Segoe UI', 9), width=8, anchor='e').pack(side=tk.LEFT)
-            tk.Label(row_frame, text=value, bg=BG_CARD, fg=TEXT_PRIMARY,
-                    font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=5)
-    
-    # Stats card
-    stats_card = tk.Frame(frame, bg=BG_CARD, padx=20, pady=15)
-    stats_card.pack(fill=tk.X, padx=20, pady=10)
-    
-    stats_frame = tk.Frame(stats_card, bg=BG_CARD)
-    stats_frame.pack()
-    
-    # Runtime
-    tk.Label(stats_frame, text="⏱ Runtime:", bg=BG_CARD, fg=TEXT_SECONDARY,
-             font=('Segoe UI', 10)).pack(side=tk.LEFT)
-    tk.Label(stats_frame, text=format_timedelta(time_elapsed), bg=BG_CARD, fg=TEXT_PRIMARY,
-             font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=(5, 20))
-    
-    # Rows processed
-    tk.Label(stats_frame, text="📊 Rows:", bg=BG_CARD, fg=TEXT_SECONDARY,
-             font=('Segoe UI', 10)).pack(side=tk.LEFT)
-    tk.Label(stats_frame, text=str(row_index if 'row_index' in globals() else 0), bg=BG_CARD, fg=TEXT_PRIMARY,
-             font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=5)
-    
-    if current_tok_file_path:
-        tok_input_btn = create_styled_button(
-            frame,
-            "Keyra aftur inn",
-            lambda path=current_tok_file_path: open_tok_input_with_file(path),
-            width=20,
-            accent=False
-        )
-        tok_input_btn.pack(pady=(5, 8))
-
-        open_btn = create_styled_button(frame, "Open File", lambda: os.startfile(current_tok_file_path), width=20, accent=False)
-        open_btn.pack(pady=(0, 10))
-
-    action_row = tk.Frame(frame, bg=BG_DARK)
-    action_row.pack(fill=tk.X, padx=28, pady=(0, 10))
-    log_button = create_styled_button(action_row, "Log", open_tok_debug_log, width=16, accent=False)
-    log_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-    back_button = create_styled_button(action_row, "Back to Menu", initialize_main_menu, width=16)
-    back_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
-    back_button.pack(pady=20)
-    finalize_page_layout()
 
 def display_stopped_screen(reason=""):
     """Show a recovery-focused summary when the script is stopped."""
@@ -790,6 +691,9 @@ def enter_data(row, row_number=None):
     date_str = row['DATE'].strftime('%Y-%m-%d') if isinstance(row['DATE'], pd.Timestamp) else row['DATE']
     actions = []
     field_delay = 0.03
+    focus_wait = _timing_value("focus_delay", 0.05)
+    paste_wait = _timing_value("paste_delay", 0.0)
+    post_paste_wait = _timing_value("post_paste_delay", 0.05)
     row_label = row_number if row_number is not None else "?"
 
     def _step(func, delay=USE_ACTION_DELAY, debug=""):
@@ -802,42 +706,42 @@ def enter_data(row, row_number=None):
         # Split into multiple steps to keep the UI responsive and allow Stop mid-row.
         text = "" if text is None else str(text)
         return [
-            _step(lambda t=text, f=field: copy_to_clipboard_verified(t, f, row_label), paste_delay, f"row={row_label} field={field} copy value='{_short_log_value(text)}'"),
-            _step(lambda: pyautogui.hotkey('ctrl', 'v'), post_paste_delay, f"row={row_label} field={field} paste"),
+            _step(lambda t=text, f=field: copy_to_clipboard_verified(t, f, row_label), paste_wait, f"row={row_label} field={field} copy value='{_short_log_value(text)}'"),
+            _step(lambda: pyautogui.hotkey('ctrl', 'v'), post_paste_wait, f"row={row_label} field={field} paste"),
         ]
 
     actions.extend(_paste_text_steps("DATE", date_str))
-    actions.append(_step(lambda: _press_enter("after DATE"), focus_delay, f"row={row_label} after DATE enter"))
+    actions.append(_step(lambda: _press_enter("after DATE"), focus_wait, f"row={row_label} after DATE enter"))
     actions.append(_step(lambda: None, field_delay, f"row={row_label} after DATE wait"))
 
     actions.extend(_paste_text_steps("TEXT", str(row['TEXT'])))
-    actions.append(_step(lambda: _press_enter("after TEXT 1"), focus_delay, f"row={row_label} after TEXT enter 1"))
-    actions.append(_step(lambda: _press_enter("after TEXT 2"), focus_delay, f"row={row_label} after TEXT enter 2"))
+    actions.append(_step(lambda: _press_enter("after TEXT 1"), focus_wait, f"row={row_label} after TEXT enter 1"))
+    actions.append(_step(lambda: _press_enter("after TEXT 2"), focus_wait, f"row={row_label} after TEXT enter 2"))
     actions.append(_step(lambda: None, field_delay, f"row={row_label} after TEXT wait"))
 
     actions.extend(_paste_text_steps("DEBIT", format_number(row['DEBIT'])))
-    actions.append(_step(lambda: _press_enter("after DEBIT"), focus_delay, f"row={row_label} after DEBIT enter"))
+    actions.append(_step(lambda: _press_enter("after DEBIT"), focus_wait, f"row={row_label} after DEBIT enter"))
     actions.append(_step(lambda: None, field_delay, f"row={row_label} after DEBIT wait"))
 
     if pd.notna(row['ID']):
         actions.extend(_paste_text_steps("ID_DEBIT_SIDE", format_number(row['ID'])))
-    actions.append(_step(lambda: _press_enter("after ID debit side"), focus_delay, f"row={row_label} after debit-side ID enter"))
+    actions.append(_step(lambda: _press_enter("after ID debit side"), focus_wait, f"row={row_label} after debit-side ID enter"))
     actions.append(_step(lambda: None, field_delay, f"row={row_label} after debit-side ID wait"))
 
     actions.extend(_paste_text_steps("AMOUNT", format_number(row['AMOUNT'])))
-    actions.append(_step(lambda: _press_enter("after AMOUNT 1"), focus_delay, f"row={row_label} after AMOUNT enter 1"))
-    actions.append(_step(lambda: _press_enter("after AMOUNT 2"), focus_delay, f"row={row_label} after AMOUNT enter 2"))
-    actions.append(_step(lambda: _press_enter("after AMOUNT 3"), focus_delay, f"row={row_label} after AMOUNT enter 3"))
-    actions.append(_step(lambda: _press_enter("after AMOUNT 4"), focus_delay, f"row={row_label} after AMOUNT enter 4"))
+    actions.append(_step(lambda: _press_enter("after AMOUNT 1"), focus_wait, f"row={row_label} after AMOUNT enter 1"))
+    actions.append(_step(lambda: _press_enter("after AMOUNT 2"), focus_wait, f"row={row_label} after AMOUNT enter 2"))
+    actions.append(_step(lambda: _press_enter("after AMOUNT 3"), focus_wait, f"row={row_label} after AMOUNT enter 3"))
+    actions.append(_step(lambda: _press_enter("after AMOUNT 4"), focus_wait, f"row={row_label} after AMOUNT enter 4"))
     actions.append(_step(lambda: None, field_delay, f"row={row_label} after AMOUNT wait"))
     actions.extend(_paste_text_steps("CREDIT", format_number(row['CREDIT'])))
-    actions.append(_step(lambda: _press_enter("after CREDIT"), focus_delay, f"row={row_label} after CREDIT enter"))
+    actions.append(_step(lambda: _press_enter("after CREDIT"), focus_wait, f"row={row_label} after CREDIT enter"))
     actions.append(_step(lambda: None, field_delay, f"row={row_label} after CREDIT wait"))
 
     if pd.notna(row['ID']):
         actions.extend(_paste_text_steps("ID_CREDIT_SIDE", format_number(row['ID'])))
-    actions.append(_step(lambda: _press_enter("after credit-side ID 1"), focus_delay, f"row={row_label} after credit-side ID enter 1"))
-    actions.append(_step(lambda: _press_enter("after credit-side ID 2"), focus_delay, f"row={row_label} after credit-side ID enter 2"))
+    actions.append(_step(lambda: _press_enter("after credit-side ID 1"), focus_wait, f"row={row_label} after credit-side ID enter 1"))
+    actions.append(_step(lambda: _press_enter("after credit-side ID 2"), focus_wait, f"row={row_label} after credit-side ID enter 2"))
 
     return actions
 
@@ -1124,22 +1028,6 @@ def select_tok_input_file(file_path, remember=True, reset_start=True):
     schedule_layout_refresh()
     return result
 
-def clear_tok_input_selection():
-    global pending_tok_df, pending_tok_file_path
-    pending_tok_df = None
-    pending_tok_file_path = None
-    if "file_path_entry" in globals() and file_path_entry and file_path_entry.winfo_exists():
-        file_path_entry.delete(0, tk.END)
-    if "tok_drop_area" in globals() and tok_drop_area and tok_drop_area.winfo_exists():
-        tok_drop_area.config(text="Drop Tok input file here or click to browse", fg=TEXT_SECONDARY)
-    if "tok_status_label" in globals() and tok_status_label and tok_status_label.winfo_exists():
-        tok_status_label.config(text="Select a Tok input Excel file to check compatibility.", fg=TEXT_SECONDARY)
-    if "tok_open_file_button" in globals() and tok_open_file_button and tok_open_file_button.winfo_exists():
-        tok_open_file_button.pack_forget()
-    reset_tok_start_row_controls()
-    schedule_layout_refresh()
-
-
 def reset_tok_start_row_controls():
     if "tok_start_mode_var" in globals() and tok_start_mode_var:
         try:
@@ -1370,9 +1258,9 @@ def display_input_controls():
     refresh_tok_recent_buttons()
 
 def run_script_with_df(row_data, start_index=0):
-    global running, actions, rows, row_index, start_time, after_id, automation_stop_reason, pending_tok_df
-    running = True
-    automation_stop_reason = ""
+    global actions, rows, row_index, start_time, pending_tok_df
+    automation_state["active"] = True
+    automation_state["stop_reason"] = ""
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
     rows = row_data if isinstance(row_data, list) else row_data.to_dict(orient='records')
@@ -1393,7 +1281,7 @@ def run_script_with_df(row_data, start_index=0):
     _cancel_scheduled_after()
     _cancel_watchdog()
     # Countdown already gave the user time to focus the target app.
-    after_id = root.after(100, process_next_action)
+    automation_state["after"] = root.after(100, process_next_action)
 
 def display_tok_input_error(message):
     for widget in frame.winfo_children():
@@ -1449,9 +1337,9 @@ def display_tok_missing_fields_prompt(missing_rows, start_index=0):
     ensure_window_fits()
 
 def start_tok_run(df, file_path, start_index=0):
-    global pending_tok_df, pending_tok_file_path, current_tok_file_path, running, automation_stop_reason, rows, row_index, current_tok_run_start_index
-    running = True
-    automation_stop_reason = ""
+    global pending_tok_df, pending_tok_file_path, current_tok_file_path, rows, row_index, current_tok_run_start_index
+    automation_state["active"] = True
+    automation_state["stop_reason"] = ""
     pending_tok_df = df
     pending_tok_file_path = file_path
     current_tok_file_path = file_path
@@ -1469,39 +1357,45 @@ def start_tok_run(df, file_path, start_index=0):
     current_tok_run_start_index = start_index
     rows = run_rows
     row_index = start_index
+    action_wait = _timing_value("action_delay", 0.1)
+    focus_wait = _timing_value("focus_delay", 0.05)
+    paste_wait = _timing_value("paste_delay", 0.0)
+    post_paste_wait = _timing_value("post_paste_delay", 0.05)
+    countdown_seconds = _timing_value("start_delay", 3, integer=True)
     write_tok_debug_log(
         f"RUN_START file='{file_path}' total_rows={total_rows} start_row={start_index + 1} "
-        f"speed={current_run_speed_label} action={action_delay:.3f} focus={focus_delay:.3f} "
-        f"paste={paste_delay:.3f} post_paste={post_paste_delay:.3f}"
+        f"speed={current_run_speed_label} action={action_wait:.3f} focus={focus_wait:.3f} "
+        f"paste={paste_wait:.3f} post_paste={post_paste_wait:.3f}"
     )
     init_progress_bar(total_rows)
-    countdown_label = create_styled_label(frame, f"Starting in {int(start_delay)} seconds...", size=11, color=TEXT_PRIMARY)
+    countdown_label = create_styled_label(frame, f"Starting in {countdown_seconds} seconds...", size=11, color=TEXT_PRIMARY)
     countdown_label.pack(pady=10)
     progress_bar['value'] = start_index
     progress_label.config(text=f"Rows processed: {start_index} / {total_rows}")
 
     def update_countdown(seconds_left):
-        global after_id
-        if not running and automation_stop_reason:
-            display_stopped_screen(automation_stop_reason)
+        stop_reason = _automation_stop_reason()
+        if not _automation_is_running() and stop_reason:
+            display_stopped_screen(stop_reason)
             return
         countdown_label.config(text=f"Starting in {seconds_left} seconds...")
         progress_bar['value'] = start_index
         progress_label.config(text=f"Rows processed: {start_index} / {total_rows}")
         if seconds_left > 0:
-            after_id = root.after(1000, update_countdown, seconds_left - 1)
+            automation_state["after"] = root.after(1000, update_countdown, seconds_left - 1)
         else:
             countdown_label.pack_forget()
-            after_id = root.after(100, lambda: run_script_with_df(run_rows, start_index=start_index))
+            automation_state["after"] = root.after(100, lambda: run_script_with_df(run_rows, start_index=start_index))
 
-    update_countdown(int(start_delay))
+    update_countdown(countdown_seconds)
 
 def process_next_action():
-    global row_index, actions, rows, watchdog_timer, after_id
-    after_id = None
-    if not running:
-        if automation_stop_reason:
-            display_stopped_screen(automation_stop_reason)
+    global row_index, actions, rows
+    automation_state["after"] = None
+    if not _automation_is_running():
+        stop_reason = _automation_stop_reason()
+        if stop_reason:
+            display_stopped_screen(stop_reason)
         return
 
     _cancel_watchdog()
@@ -1513,11 +1407,11 @@ def process_next_action():
         else:
             func, delay = action
             debug_text = ""
-        if not running:
+        if not _automation_is_running():
             return
         if _mouse_in_main_top_left():
             _stop_for_mouse_failsafe()
-            display_stopped_screen(automation_stop_reason)
+            display_stopped_screen(_automation_stop_reason())
             return
         _arm_watchdog()
         try:
@@ -1527,21 +1421,21 @@ def process_next_action():
         except pyautogui.FailSafeException:
             logging.info("PyAutoGUI fail-safe triggered.")
             _stop_for_mouse_failsafe()
-            display_stopped_screen(automation_stop_reason)
+            display_stopped_screen(_automation_stop_reason())
             return
         except Exception:
             logging.exception("Action failed; stopping automation.")
             _mark_automation_stopped("Automation stopped after a paste/key action failed.")
             _cancel_watchdog()
-            display_stopped_screen(automation_stop_reason)
+            display_stopped_screen(_automation_stop_reason())
             play_error_sound()
             return
-        if not running:
-            display_stopped_screen(automation_stop_reason)
+        if not _automation_is_running():
+            display_stopped_screen(_automation_stop_reason())
             return
         _arm_watchdog()
-        next_delay = action_delay if delay is USE_ACTION_DELAY else delay
-        after_id = root.after(_after_ms(next_delay), process_next_action)
+        next_delay = _timing_value("action_delay", 0.1) if delay is USE_ACTION_DELAY else delay
+        automation_state["after"] = root.after(_after_ms(next_delay), process_next_action)
     else:
         write_tok_debug_log(f"ROW_DONE row={row_index + 1}")
         row_index += 1
@@ -1552,11 +1446,11 @@ def process_next_action():
             write_tok_debug_log(f"ROW_START row={row_index + 1}")
             update_progress(row_index)
             _arm_watchdog()
-            after_id = root.after(_after_ms(action_delay), process_next_action)
+            automation_state["after"] = root.after(_after_ms(_timing_value("action_delay", 0.1)), process_next_action)
 
 def complete_script():
-    global start_time, watchdog_timer, running, actions
-    running = False
+    global start_time, actions
+    automation_state["active"] = False
     actions = []
     _cancel_watchdog()
     end_time = datetime.datetime.now()
@@ -1613,75 +1507,59 @@ def decrease_start_delay():
     _sync_settings_from_ui()
 
 def increase_action_delay():
-    global action_delay
     current_value = float(settings_action_entry.get())
     new_value = current_value + 0.001
     settings_action_entry.delete(0, tk.END)
     settings_action_entry.insert(0, f"{new_value:.3f}")
-    action_delay = new_value
     _sync_settings_from_ui()
 
 def decrease_action_delay():
-    global action_delay
     current_value = float(settings_action_entry.get())
     new_value = max(0, current_value - 0.001)
     settings_action_entry.delete(0, tk.END)
     settings_action_entry.insert(0, f"{new_value:.3f}")
-    action_delay = new_value
     _sync_settings_from_ui()
 
 def increase_focus_delay():
-    global focus_delay
     current_value = float(settings_focus_entry.get())
     new_value = current_value + 0.001
     settings_focus_entry.delete(0, tk.END)
     settings_focus_entry.insert(0, f"{new_value:.3f}")
-    focus_delay = new_value
     _sync_settings_from_ui()
 
 def decrease_focus_delay():
-    global focus_delay
     current_value = float(settings_focus_entry.get())
     new_value = max(0, current_value - 0.001)
     settings_focus_entry.delete(0, tk.END)
     settings_focus_entry.insert(0, f"{new_value:.3f}")
-    focus_delay = new_value
     _sync_settings_from_ui()
 
 def increase_paste_delay():
-    global paste_delay
     current_value = float(settings_paste_entry.get())
     new_value = current_value + 0.001
     settings_paste_entry.delete(0, tk.END)
     settings_paste_entry.insert(0, f"{new_value:.3f}")
-    paste_delay = new_value
     _sync_settings_from_ui()
 
 def decrease_paste_delay():
-    global paste_delay
     current_value = float(settings_paste_entry.get())
     new_value = max(0, current_value - 0.001)
     settings_paste_entry.delete(0, tk.END)
     settings_paste_entry.insert(0, f"{new_value:.3f}")
-    paste_delay = new_value
     _sync_settings_from_ui()
 
 def increase_post_paste_delay():
-    global post_paste_delay
     current_value = float(settings_post_paste_entry.get())
     new_value = current_value + 0.001
     settings_post_paste_entry.delete(0, tk.END)
     settings_post_paste_entry.insert(0, f"{new_value:.3f}")
-    post_paste_delay = new_value
     _sync_settings_from_ui()
 
 def decrease_post_paste_delay():
-    global post_paste_delay
     current_value = float(settings_post_paste_entry.get())
     new_value = max(0, current_value - 0.001)
     settings_post_paste_entry.delete(0, tk.END)
     settings_post_paste_entry.insert(0, f"{new_value:.3f}")
-    post_paste_delay = new_value
     _sync_settings_from_ui()
 
 def initialize_main_menu():
@@ -2377,7 +2255,7 @@ def configure_bank_formatter_bridge():
 # =============================================================================
 
 def main():
-    global root, settings, action_delay, focus_delay, paste_delay, post_paste_delay, start_delay
+    global root, settings
     global style, header_frame, logo_image, logo_image_small, logo_label
     global title_frame, page_title_label, frame
 
@@ -2387,11 +2265,7 @@ def main():
         root = tk.Tk()
     settings = load_settings()
     apply_theme(settings.get("theme", "light"))
-    action_delay = settings.get("action_delay", 0.1)
-    focus_delay = settings.get("focus_delay", 0.02)
-    paste_delay = settings.get("paste_delay", 0.0)
-    post_paste_delay = settings.get("post_paste_delay", 0.02)
-    start_delay = settings.get("start_delay", 3)
+    _sync_runtime_timing_from_settings()
     root.title("Tok Tenging")
     root.geometry("680x700")
     root.configure(bg=BG_DARK)

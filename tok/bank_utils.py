@@ -45,7 +45,7 @@ def autofit_excel_columns(file_path):
         "yellow": PatternFill(fill_type="solid", fgColor="FFFF00"),
         "green": PatternFill(fill_type="solid", fgColor="00B050"),
     }
-
+    
     # Find special column indexes.
     date_col_idx = None
     confidence_col_idx = None
@@ -67,7 +67,7 @@ def autofit_excel_columns(file_path):
         if confidence < 85:
             return confidence_fills["yellow"]
         return confidence_fills["green"]
-
+    
     for col in ws.columns:
         max_length = 0
         column = get_column_letter(col[0].column)
@@ -390,3 +390,4 @@ def _parse_icelandic_date(val):
         return ''
     text = str(val).strip()
     return text
+

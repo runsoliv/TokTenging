@@ -7,7 +7,6 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import json
 import math
-import os
 import re
 import sys
 import unicodedata

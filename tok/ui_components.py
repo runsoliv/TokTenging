@@ -500,3 +500,4 @@ def attach_auto_resize_text(text_widget, min_lines=6, max_lines=8):
     text_widget.bind("<MouseWheel>", _on_mousewheel)
     _resize()
     return _resize
+

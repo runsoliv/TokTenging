@@ -19,6 +19,7 @@ a = Analysis(
         'bank_utils',
         'ui_components',
         'pypdf',
+        'tkinterdnd2',
     ],
     hookspath=[],
     hooksconfig={},

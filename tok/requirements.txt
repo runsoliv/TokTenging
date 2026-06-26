@@ -1,0 +1,6 @@
+pandas
+openpyxl
+pyautogui
+pyperclip
+tkinterdnd2
+pypdf

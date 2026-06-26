@@ -120,7 +120,7 @@ def initialize_bank_formatter():
     for widget in frame.winfo_children():
         widget.destroy()
     set_page_title("Bank Formatter")
-
+    
     display_bank_formatter_controls()
 
 def set_bank_formatter_status(message, color=TEXT_SECONDARY, show_open=False):
@@ -194,14 +194,6 @@ def select_bank_input_file(file_path, remember=True):
     schedule_layout_refresh()
     return bank_type
 
-def clear_bank_input_selection():
-    if "bank_input_file_entry" in globals() and bank_input_file_entry and bank_input_file_entry.winfo_exists():
-        bank_input_file_entry.delete(0, tk.END)
-    if "input_drop" in globals() and input_drop and input_drop.winfo_exists():
-        input_drop.config(text="Drop bank Excel file here or click to browse", fg=TEXT_SECONDARY)
-    set_bank_formatter_status("Select input file to auto-detect bank", TEXT_SECONDARY, show_open=False)
-    schedule_layout_refresh()
-
 def display_bank_formatter_controls():
     global bank_input_file_entry, bank_status_label, bank_output_name_entry, bank_auto_code_var, bank_restaurant_mode_var
     global bank_counter_mode_var, bank_counter_code_entry
@@ -214,19 +206,19 @@ def display_bank_formatter_controls():
     # Using two drop areas stacked: top for input, bottom for output
     drop_frame = tk.Frame(controls_frame, bg=BG_CARD)
     drop_frame.pack(fill=tk.X)
-
+    
     # Input drop
     input_label = create_styled_label(drop_frame, "Input file", size=10, color=TEXT_PRIMARY, bold=True)
     input_label.pack(anchor='w', pady=(0, 6))
     input_drop = create_drop_box(drop_frame, "Drop bank Excel file here or click to browse", height=5)
     input_drop.pack(fill=tk.X, pady=(0, 8))
-
+    
     bank_input_file_entry = create_styled_entry(drop_frame, width=35)
     bank_input_file_entry.pack_forget()
 
     bank_recent_files_frame = tk.Frame(drop_frame, bg=BG_CARD)
     bank_recent_files_frame.pack(fill=tk.X, pady=(0, 8))
-
+    
     def on_drop_input(path):
         if path:
             select_bank_input_file(path)
@@ -374,7 +366,7 @@ def display_bank_formatter_controls():
     action_row.pack(fill=tk.X, pady=(0, 8))
     run_btn = create_styled_button(action_row, "Run", lambda: run_bank_formatter_script(autofill_7810=True), width=38, height=42)
     run_btn.pack(fill=tk.X, expand=True)
-
+    
     nav_row = tk.Frame(controls_frame, bg=BG_CARD)
     nav_row.pack(fill=tk.X)
     refresh_btn = create_styled_button(nav_row, "Refresh File", refresh_bank_file, width=18, accent=False, height=42)
@@ -388,8 +380,8 @@ def display_bank_formatter_controls():
 
 def browse_bank_input_file():
     filename = filedialog.askopenfilename(
-        initialdir=os.getcwd(),
-        title="Select Input File",
+        initialdir=os.getcwd(), 
+        title="Select Input File", 
         filetypes=(("Excel files", "*.xlsx *.xls *.xlsm"), ("All files", "*.*"))
     )
     if filename:
@@ -424,10 +416,6 @@ def _bank_restaurant_mode_enabled():
         return bool(bank_restaurant_mode_var.get())
     except Exception:
         return False
-
-
-def _bank_industry_context():
-    return "restaurant" if _bank_restaurant_mode_enabled() else ""
 
 
 def _normalize_bank_counter_code(value):
@@ -1620,20 +1608,20 @@ def run_bank_formatter_script(autofill_7810=True):
     restaurant_mode = _bank_restaurant_mode_enabled()
     industry_context = "restaurant" if restaurant_mode else ""
     fill_counter, counter_code = _bank_counter_fill(autofill_7810)
-
+    
     if not input_file_path:
         set_bank_formatter_status("Please select an input file", TEXT_WARNING)
         return
-
+    
     bank_type, df = detect_bank_type(input_file_path)
-
+    
     if bank_type is None:
         set_bank_formatter_status("Could not detect bank format", TEXT_ERROR, show_open=True)
         play_error_sound()
         return
-
+    
     config = BANK_CONFIGS[bank_type]
-
+    
     try:
         # Check if this bank needs custom processing
         if config.get('custom_processor'):
@@ -1656,10 +1644,10 @@ def run_bank_formatter_script(autofill_7810=True):
             amount_source = _arion_amount_source(df, amount_col) if bank_type == 'arion' else extracted_columns[amount_col]
             extracted_columns['Positive/Negative'] = amount_source.apply(_bank_amount_sign)
             extracted_columns[amount_col] = amount_source.apply(_bank_amount_abs)
-
+            
             # Rename to standard format
             extracted_columns.rename(columns=config['rename'], inplace=True)
-
+            
             # Insert DEBIT and CREDIT columns
             extracted_columns.insert(2, 'DEBIT', '')
             extracted_columns.insert(5, 'CREDIT', '')
@@ -1682,21 +1670,21 @@ def run_bank_formatter_script(autofill_7810=True):
                 enabled=auto_code_debits and not config.get('skip_auto_coding', False),
             )
             extracted_columns = _strip_auto_code_internal_columns(extracted_columns)
-
+            
             # Sort by Positive/Negative and TEXT
             extracted_columns = extracted_columns.sort_values(by=['Positive/Negative', 'TEXT'])
-
+            
             # Convert DATE to text to preserve format on copy-paste
             extracted_columns['DATE'] = extracted_columns['DATE'].apply(format_date_as_text)
-
+            
             # Save to Excel
             _prepare_bank_excel_output(extracted_columns).to_excel(output_file_path, index=False)
-
+            
             # Auto-fit column widths
             autofit_excel_columns(output_file_path)
-
+            
             display_bank_formatter_success(config['name'], output_file_path)
-
+        
     except Exception as e:
         set_bank_formatter_status(f"✗ Error: {str(e)[:40]}", TEXT_ERROR)
         play_error_sound()
@@ -2197,7 +2185,7 @@ def display_bank_formatter_success(bank_name, output_file_path):
                                      fill=TEXT_SECONDARY, font=('Segoe UI', 9))
         processed_canvas.create_text(15, 47, text=bank_name, anchor="w",
                                      fill=TEXT_PRIMARY, font=('Segoe UI', 11, 'bold'))
-
+    
     card_shell, card = create_panel(frame, padx=22, pady=18)
     card_shell.pack(fill=tk.X, padx=42, pady=(8, 16))
 
@@ -2362,3 +2350,4 @@ def display_bank_formatter_success(bank_name, output_file_path):
 
     back_button = create_styled_button(frame, "← Back to Menu", initialize_main_menu, width=20)
     ensure_window_fits()
+

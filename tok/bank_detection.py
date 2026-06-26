@@ -115,7 +115,7 @@ def detect_bank_type(file_path):
             return 'islandsbanki', df
     except Exception:
         pass  # Sheet doesn't exist, try others
-
+    
     # Try reading default sheet for other banks
     try:
         df = pd.read_excel(file_path)
@@ -125,12 +125,12 @@ def detect_bank_type(file_path):
         # Arion has "Heiti" / "IBAN númer" at top, Landsbanki has "Netbanki fyrirtækja"
         first_col = str(df.columns[0]).lower() if len(df.columns) > 0 else ''
         has_metadata_header = any(keyword in first_col for keyword in ['heiti', 'netbanki', 'iban'])
-
+        
         # Also check first cell value for metadata text
         if not has_metadata_header and len(df) > 0:
             first_val = str(df.iloc[0, 0]).lower() if pd.notna(df.iloc[0, 0]) else ''
             has_metadata_header = any(keyword in first_val for keyword in ['heiti', 'netbanki', 'iban', 'færslur'])
-
+        
         if has_metadata_header:
             # Try reading with header on row 3 (0-indexed, Excel row 4)
             df_skip3 = pd.read_excel(file_path, header=3)
@@ -147,15 +147,15 @@ def detect_bank_type(file_path):
             # Landsbankinn card transactions also usually use row 4 as header.
             if BANK_CONFIGS['landsbankinn_kort']['detect_cols'].issubset(cols_skip3):
                 return 'landsbankinn_kort', df_skip3
-
+            
             # Try reading with header on row 4 (0-indexed, Excel row 5)
             df_skip4 = pd.read_excel(file_path, header=4)
             cols_skip4 = set(df_skip4.columns)
-
+            
             # Check Landsbanki (usually row 5)
             if BANK_CONFIGS['landsbanki']['detect_cols'].issubset(cols_skip4):
                 return 'landsbanki', df_skip4
-
+            
             # Check Arion on row 5 as fallback
             if BANK_CONFIGS['arion']['detect_cols'].issubset(cols_skip4):
                 return 'arion', df_skip4
@@ -198,7 +198,7 @@ def detect_bank_type(file_path):
         if innheimta_header is not None:
             df_innheimta = pd.read_excel(file_path, header=innheimta_header)
             return 'islandsbanki_innheimta', df_innheimta
-
+        
         # Standard detection (no metadata rows)
         # Check Islandsbanki Innheimta first (more specific columns)
         if BANK_CONFIGS['islandsbanki_innheimta']['detect_cols'].issubset(cols):
@@ -221,15 +221,16 @@ def detect_bank_type(file_path):
         # Arion Kort
         if BANK_CONFIGS['arion_kort']['detect_cols'].issubset(cols):
             return 'arion_kort', df
-
+        
         # Check Landsbanki
         if BANK_CONFIGS['landsbanki']['detect_cols'].issubset(cols):
             return 'landsbanki', df
-
+        
         # Check Arion
         if BANK_CONFIGS['arion']['detect_cols'].issubset(cols):
             return 'arion', df
     except Exception:
         pass
-
+    
     return None, None
+

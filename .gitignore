@@ -15,7 +15,6 @@ dist_*/
 # Local app/runtime output
 *.log
 *.backup.py
-*.codex-current.py
 tok/trainingCoded/
 tok/trainingRaw/
 tok/special cases do not touch/
