@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
 
 a = Analysis(
     ['TokTenging.py'],
@@ -10,6 +12,11 @@ a = Analysis(
         ('success.wav', 'tok'),
         ('error.wav', 'tok'),
         ('Tok-Tenging.ico', 'tok'),
+        *(
+            [(str(Path('data folder') / 'data codex.xlsx'), 'tok\\data folder')]
+            if (Path('data folder') / 'data codex.xlsx').exists()
+            else []
+        ),
     ],
     hiddenimports=[
         '_tkinter',
@@ -17,6 +24,19 @@ a = Analysis(
         'bank_detection',
         'bank_formatter',
         'bank_utils',
+        'coded_file_tools',
+        'email_downloader',
+        'folder_printer',
+        'ml_artifacts',
+        'ml_dataset',
+        'ml_evaluation',
+        'ml_features',
+        'ml_model',
+        'ml_runtime',
+        'ml_training',
+        'shareholder_registry',
+        'shareholder_registry_data',
+        'training_archive',
         'ui_components',
         'pypdf',
         'tkinterdnd2',

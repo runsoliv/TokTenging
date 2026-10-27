@@ -18,8 +18,19 @@ datas = [
     ('tok\\success.wav', 'tok'),
     ('tok\\error.wav', 'tok'),
     ('tok\\Tok-Tenging.ico', 'tok'),
-    ('tok\\trainingCoded', 'tok\\trainingCoded'),
 ]
+
+legacy_training = Path('tok') / 'trainingCoded'
+if legacy_training.exists():
+    datas.append((str(legacy_training), 'tok\\trainingCoded'))
+
+registry_workbook = Path('tok') / 'trainingData' / 'data folder' / 'data codex.xlsx'
+if registry_workbook.exists():
+    datas.append((str(registry_workbook), 'tok\\trainingData\\data folder'))
+
+ml_artifacts = Path('tok') / 'trainingData' / 'ml_artifacts'
+if ml_artifacts.exists():
+    datas.append((str(ml_artifacts), 'tok\\trainingData\\ml_artifacts'))
 
 for source, target in (
     (Path('tok') / 'coded keys', 'tok\\coded keys'),
@@ -33,7 +44,7 @@ for source, target in (
 
 a = Analysis(
     ['tok\\TokTenging.py'],
-    pathex=[],
+    pathex=['tok'],
     binaries=binaries,
     datas=datas,
     hiddenimports=[
@@ -42,6 +53,19 @@ a = Analysis(
         'bank_detection',
         'bank_formatter',
         'bank_utils',
+        'coded_file_tools',
+        'email_downloader',
+        'folder_printer',
+        'ml_artifacts',
+        'ml_dataset',
+        'ml_evaluation',
+        'ml_features',
+        'ml_model',
+        'ml_runtime',
+        'ml_training',
+        'shareholder_registry',
+        'shareholder_registry_data',
+        'training_archive',
         'ui_components',
         'pypdf',
         'tkinterdnd2',

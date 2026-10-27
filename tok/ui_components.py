@@ -6,56 +6,57 @@ TKDND_AVAILABLE = False
 DND_FILES = None
 _layout_refresh_callback = lambda: None
 
-BG_DARK = '#d9e8eb'        # App background
-BG_CARD = '#f8fbfa'        # Panel background
-BG_INPUT = '#f7fbfc'       # Input/drop area background
-BORDER = '#9fb8c1'         # Subtle borders
-ACCENT = '#1b87ea'         # Primary action
-ACCENT_HOVER = '#1575cc'   # Primary hover
-ACCENT_SOFT = '#d9ecff'    # Selected/soft accent
-TEXT_PRIMARY = '#102027'   # Main text
-TEXT_SECONDARY = '#4f6570' # Muted text
+BG_DARK = '#eef3f8'        # App background
+BG_CARD = '#ffffff'        # Panel background
+BG_INPUT = '#f6f8fb'       # Input/drop area background
+BORDER = '#d4dee9'         # Subtle borders
+ACCENT = '#2563eb'         # Primary action
+ACCENT_HOVER = '#1d4ed8'   # Primary hover
+ACCENT_SOFT = '#e8f0ff'    # Selected/soft accent
+TEXT_PRIMARY = '#162033'   # Main text
+TEXT_SECONDARY = '#64748b' # Muted text
 TEXT_ON_ACCENT = '#ffffff'
 TEXT_SUCCESS = '#0f766e'   # Green for success
 TEXT_ERROR = '#dc2626'     # Red for errors
 TEXT_WARNING = '#b45309'   # Amber for warnings
-BUTTON_MUTED = '#edf1f5'
-BUTTON_MUTED_HOVER = '#e1e8ef'
+BUTTON_MUTED = '#eef2f7'
+BUTTON_MUTED_HOVER = '#e2e8f0'
 
 THEMES = {
     "light": {
-        "BG_DARK": '#d9e8eb',
-        "BG_CARD": '#f8fbfa',
-        "BG_INPUT": '#f7fbfc',
-        "BORDER": '#9fb8c1',
-        "ACCENT": '#1b87ea',
-        "ACCENT_HOVER": '#1575cc',
-        "ACCENT_SOFT": '#d9ecff',
-        "TEXT_PRIMARY": '#102027',
-        "TEXT_SECONDARY": '#4f6570',
+        "BG_DARK": '#eef3f8',
+        "BG_CARD": '#ffffff',
+        "BG_INPUT": '#f6f8fb',
+        "BORDER": '#d4dee9',
+        "ACCENT": '#2563eb',
+        "ACCENT_HOVER": '#1d4ed8',
+        "ACCENT_SOFT": '#e8f0ff',
+        "TEXT_PRIMARY": '#162033',
+        "TEXT_SECONDARY": '#64748b',
         "TEXT_ON_ACCENT": '#ffffff',
         "TEXT_SUCCESS": '#0f766e',
         "TEXT_ERROR": '#dc2626',
         "TEXT_WARNING": '#b45309',
-        "BUTTON_MUTED": '#edf1f5',
-        "BUTTON_MUTED_HOVER": '#e1e8ef',
+        "BUTTON_MUTED": '#eef2f7',
+        "BUTTON_MUTED_HOVER": '#e2e8f0',
     },
     "dark": {
-        "BG_DARK": '#171821',
-        "BG_CARD": '#2f3140',
-        "BG_INPUT": '#494c5d',
-        "BORDER": '#3e4255',
-        "ACCENT": '#1b87ea',
-        "ACCENT_HOVER": '#3097f4',
-        "ACCENT_SOFT": '#233c5d',
-        "TEXT_PRIMARY": '#f5f6fb',
-        "TEXT_SECONDARY": '#bbc1cf',
+        "BG_DARK": '#0f141b',
+        "BG_CARD": '#171e28',
+        "BG_INPUT": '#202938',
+        "BORDER": '#2d394a',
+        # Keep white labels AA-readable on compact primary buttons.
+        "ACCENT": '#2563eb',
+        "ACCENT_HOVER": '#1d4ed8',
+        "ACCENT_SOFT": '#1f3552',
+        "TEXT_PRIMARY": '#f3f6fa',
+        "TEXT_SECONDARY": '#9faec0',
         "TEXT_ON_ACCENT": '#ffffff',
         "TEXT_SUCCESS": '#5ee7a8',
         "TEXT_ERROR": '#fb7185',
         "TEXT_WARNING": '#fbbf24',
-        "BUTTON_MUTED": '#494c5d',
-        "BUTTON_MUTED_HOVER": '#5b6078',
+        "BUTTON_MUTED": '#253044',
+        "BUTTON_MUTED_HOVER": '#31405a',
     },
 }
 
@@ -82,13 +83,13 @@ def set_layout_refresh_callback(callback):
     _layout_refresh_callback = callback or (lambda: None)
 
 
-def _parse_drop_data(data: str) -> str:
-    """Extract first file path from tkdnd drop data."""
+def _parse_drop_paths(data: str) -> list[str]:
+    """Extract all file paths from tkdnd Tcl-list drop data."""
     if not data:
-        return ""
+        return []
     data = data.strip()
     if not data:
-        return ""
+        return []
     # tkdnd uses a Tcl list format: items may be wrapped in braces if they contain spaces.
     items = []
     buf = ""
@@ -111,6 +112,12 @@ def _parse_drop_data(data: str) -> str:
         buf += ch
     if buf:
         items.append(buf)
+    return items
+
+
+def _parse_drop_data(data: str) -> str:
+    """Extract first file path from tkdnd drop data."""
+    items = _parse_drop_paths(data)
     return items[0] if items else ""
 
 def attach_drop_target(widget, on_path):
@@ -125,6 +132,21 @@ def attach_drop_target(widget, on_path):
         except Exception:
             widget.drop_target_register('DND_Files')
         widget.dnd_bind('<<Drop>>', lambda e: on_path(_parse_drop_data(e.data)))
+        return True
+    except Exception:
+        return False
+
+
+def attach_drop_target_many(widget, on_paths):
+    """Make a widget accept one or more dropped files."""
+    if not TKDND_AVAILABLE:
+        return False
+    try:
+        try:
+            widget.drop_target_register(DND_FILES)
+        except Exception:
+            widget.drop_target_register('DND_Files')
+        widget.dnd_bind('<<Drop>>', lambda event: on_paths(_parse_drop_paths(event.data)))
         return True
     except Exception:
         return False
@@ -156,7 +178,10 @@ class RoundedButton(tk.Canvas):
         self.hover_bg = ACCENT_HOVER if accent else BUTTON_MUTED_HOVER
         self.text_color = TEXT_ON_ACCENT if accent else TEXT_PRIMARY
         self.border_color = '' if accent else BORDER
-        pixel_width = max(110, int(width) * 9)
+        # ``width`` remains character-like for compatibility, but compact
+        # toolbar actions should not be forced to the old 110 px minimum.
+        # The text allowance keeps longer translated labels from clipping.
+        pixel_width = max(72, int(width) * 8, len(str(text)) * 7 + 28)
         super().__init__(
             parent,
             width=pixel_width,
@@ -165,32 +190,57 @@ class RoundedButton(tk.Canvas):
             highlightthickness=0,
             bd=0,
             cursor='hand2',
+            takefocus=True,
         )
         self._current_bg = self.normal_bg
         self._pressed = False
+        self._focused = False
+        self._enabled = True
         self.bind('<Configure>', lambda _e: self._draw())
         self.bind('<Enter>', self._on_enter)
         self.bind('<Leave>', self._on_leave)
         self.bind('<ButtonPress-1>', self._on_press)
         self.bind('<ButtonRelease-1>', self._on_release)
+        self.bind('<FocusIn>', self._on_focus_in)
+        self.bind('<FocusOut>', self._on_focus_out)
+        self.bind('<Return>', self._activate)
+        self.bind('<space>', self._activate)
         self._draw()
 
     def _draw(self):
         self.delete('all')
         w = max(4, self.winfo_width())
         h = max(4, self.winfo_height())
-        offset = 1 if self._pressed else 0
-        _rounded_rect(self, 2, 2 + offset, w - 2, h - 2 + offset, 14,
-                      fill=self._current_bg, outline=self.border_color, width=1)
+        radius = max(7, min(10, self.button_height // 4))
+        outline = self.border_color
+        outline_width = 1
+        if self._pressed or self._focused:
+            outline = TEXT_ON_ACCENT if self.accent else ACCENT
+            outline_width = 2
+        fill = self._current_bg if self._enabled else BG_INPUT
+        text_color = self.text_color if self._enabled else TEXT_SECONDARY
+        _rounded_rect(
+            self,
+            2,
+            2,
+            w - 2,
+            h - 2,
+            radius,
+            fill=fill,
+            outline=outline,
+            width=outline_width,
+        )
         self.create_text(
             w / 2,
-            h / 2 + offset,
+            h / 2,
             text=self.text,
-            fill=self.text_color,
+            fill=text_color,
             font=('Segoe UI Semibold', 9 if self.button_height < 42 else 10),
         )
 
     def _on_enter(self, _event):
+        if not self._enabled:
+            return
         self._current_bg = self.hover_bg
         self._draw()
 
@@ -200,16 +250,40 @@ class RoundedButton(tk.Canvas):
         self._draw()
 
     def _on_press(self, _event):
+        if not self._enabled:
+            return
+        self.focus_set()
         self._pressed = True
+        self._current_bg = self.hover_bg
         self._draw()
 
     def _on_release(self, event):
+        if not self._enabled:
+            return
         was_pressed = self._pressed
+        is_inside = 0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height()
         self._pressed = False
-        self._current_bg = self.hover_bg
+        self._current_bg = self.hover_bg if is_inside else self.normal_bg
         self._draw()
-        if was_pressed and 0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height():
+        if was_pressed and is_inside:
             self.command()
+
+    def _on_focus_in(self, _event):
+        if not self._enabled:
+            return
+        self._focused = True
+        self._draw()
+
+    def _on_focus_out(self, _event):
+        self._focused = False
+        self._pressed = False
+        self._draw()
+
+    def _activate(self, _event=None):
+        if not self._enabled:
+            return 'break'
+        self.command()
+        return 'break'
 
     def set_style(self, accent=True):
         self.accent = accent
@@ -224,9 +298,171 @@ class RoundedButton(tk.Canvas):
         self.text = text
         self._draw()
 
+    def set_enabled(self, enabled=True):
+        self._enabled = bool(enabled)
+        self._pressed = False
+        self._focused = False
+        self._current_bg = self.normal_bg
+        self.configure(cursor='hand2' if self._enabled else 'arrow', takefocus=self._enabled)
+        self._draw()
+
 def create_styled_button(parent, text, command, width=20, accent=True, height=46):
     """Create a rounded app button."""
     return RoundedButton(parent, text, command, width=width, accent=accent, height=height)
+
+
+class FeatureCardButton(tk.Canvas):
+    """Large, keyboard-accessible navigation card for a featured service."""
+
+    def __init__(self, parent, title, subtitle, command, badge="", height=104):
+        self.command = command
+        self.title = title
+        self.subtitle = subtitle
+        self.badge = badge
+        self.card_height = int(height)
+        self._hovered = False
+        self._pressed = False
+        self._focused = False
+        super().__init__(
+            parent,
+            height=self.card_height,
+            bg=_parent_bg(parent),
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+            takefocus=True,
+        )
+        self.bind("<Configure>", self._draw)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<Return>", self._activate)
+        self.bind("<space>", self._activate)
+        self._draw()
+
+    def _draw(self, _event=None):
+        self.delete("all")
+        width = max(4, self.winfo_width())
+        height = max(4, self.winfo_height())
+        offset = 1 if self._pressed else 0
+        fill = ACCENT_SOFT if not self._hovered else BG_INPUT
+        outline = ACCENT if self._hovered or self._focused else BORDER
+        outline_width = 2 if self._focused else 1
+        _rounded_rect(
+            self,
+            2,
+            2 + offset,
+            width - 2,
+            height - 2 + offset,
+            16,
+            fill=fill,
+            outline=outline,
+            width=outline_width,
+        )
+        self.create_rectangle(3, 20 + offset, 8, height - 20 + offset, fill=ACCENT, outline="")
+
+        icon_x = 47
+        icon_y = height / 2 + offset
+        self.create_oval(icon_x - 23, icon_y - 23, icon_x + 23, icon_y + 23, fill=ACCENT, outline="")
+        self.create_text(
+            icon_x,
+            icon_y,
+            text="H",
+            fill=TEXT_ON_ACCENT,
+            font=("Segoe UI Semibold", 17),
+        )
+
+        text_x = 86
+        self.create_text(
+            text_x,
+            height / 2 - 13 + offset,
+            text=self.title,
+            fill=TEXT_PRIMARY,
+            font=("Segoe UI Semibold", 15),
+            anchor="w",
+        )
+        self.create_text(
+            text_x,
+            height / 2 + 16 + offset,
+            text=self.subtitle,
+            fill=TEXT_SECONDARY,
+            font=("Segoe UI", 9),
+            anchor="w",
+            width=max(120, width - text_x - 150),
+        )
+
+        right_edge = width - 28
+        self.create_text(
+            right_edge,
+            height / 2 + offset,
+            text="›",
+            fill=ACCENT,
+            font=("Segoe UI Semibold", 24),
+            anchor="e",
+        )
+        if self.badge:
+            badge_width = max(70, len(self.badge) * 7 + 18)
+            badge_right = right_edge - 30
+            badge_left = badge_right - badge_width
+            _rounded_rect(
+                self,
+                badge_left,
+                15 + offset,
+                badge_right,
+                39 + offset,
+                10,
+                fill=ACCENT,
+                outline="",
+            )
+            self.create_text(
+                (badge_left + badge_right) / 2,
+                27 + offset,
+                text=self.badge,
+                fill=TEXT_ON_ACCENT,
+                font=("Segoe UI Semibold", 8),
+            )
+
+    def _on_enter(self, _event):
+        self._hovered = True
+        self._draw()
+
+    def _on_leave(self, _event):
+        self._hovered = False
+        self._pressed = False
+        self._draw()
+
+    def _on_press(self, _event):
+        self.focus_set()
+        self._pressed = True
+        self._draw()
+
+    def _on_release(self, event):
+        should_activate = self._pressed and 0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height()
+        self._pressed = False
+        self._draw()
+        if should_activate:
+            self.command()
+
+    def _on_focus_in(self, _event):
+        self._focused = True
+        self._draw()
+
+    def _on_focus_out(self, _event):
+        self._focused = False
+        self._pressed = False
+        self._draw()
+
+    def _activate(self, _event=None):
+        self.command()
+        return "break"
+
+
+def create_feature_card(parent, title, subtitle, command, badge="", height=104):
+    """Create a large featured-service navigation card."""
+    return FeatureCardButton(parent, title, subtitle, command, badge=badge, height=height)
 
 
 def set_button_accent(button, accent=True):
@@ -241,18 +477,26 @@ def set_button_accent(button, accent=True):
     button.bind('<Leave>', lambda e, b=button, normal=bg: b.configure(bg=normal))
 
 
-def create_segmented_setting(parent, label, variable, choices, hint=""):
+def create_segmented_setting(parent, label, variable, choices, hint="", stacked=False):
     row = tk.Frame(parent, bg=BG_CARD)
 
     text_col = tk.Frame(row, bg=BG_CARD)
-    text_col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+    if stacked:
+        text_col.pack(fill=tk.X)
+    else:
+        text_col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
     create_styled_label(text_col, label, size=9, color=TEXT_PRIMARY, bold=True, bg=BG_CARD).pack(anchor='w')
     if hint:
         hint_label = create_styled_label(text_col, hint, size=8, color=TEXT_SECONDARY, bg=BG_CARD)
+        if stacked:
+            hint_label.configure(wraplength=420, justify='left')
         hint_label.pack(anchor='w', pady=(1, 0))
 
     button_row = tk.Frame(row, bg=BG_CARD)
-    button_row.pack(side=tk.RIGHT)
+    if stacked:
+        button_row.pack(fill=tk.X, pady=(8, 0))
+    else:
+        button_row.pack(side=tk.RIGHT)
     buttons = []
 
     def refresh():
@@ -266,7 +510,12 @@ def create_segmented_setting(parent, label, variable, choices, hint=""):
 
     for index, (text, value) in enumerate(choices):
         button = create_styled_button(button_row, text, lambda v=value: select(v), width=9, accent=False, height=34)
-        button.pack(side=tk.LEFT, padx=(0, 6) if index < len(choices) - 1 else (0, 0))
+        button.pack(
+            side=tk.LEFT,
+            fill=tk.X if stacked else tk.NONE,
+            expand=stacked,
+            padx=(0, 6) if index < len(choices) - 1 else (0, 0),
+        )
         buttons.append((button, value))
 
     refresh()

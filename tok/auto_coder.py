@@ -7,9 +7,11 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import json
 import math
+import os
 import re
 import sys
 import unicodedata
+import uuid
 
 import pandas as pd
 
@@ -48,6 +50,13 @@ TEXT_SIGNAL_COLUMNS = [
     "Nafn vidtakanda eda greidanda",
 ]
 
+PAIR_REFERENCE_COLUMN_KEYS = {
+    "tnrsedilnr",
+    "sedilnr",
+    "sedilnumer",
+    "krofunumer",
+}
+
 LEGAL_SUFFIXES = {
     "ehf", "hf", "slf", "ohf", "ses", "sf", "bs", "llc", "ltd", "inc",
     "co", "com", "ab", "as", "gmbh",
@@ -78,7 +87,8 @@ GENERIC_TRAINING_PATTERNS = [
 ]
 
 MEMORY_FILENAME = "auto_code_memory.json"
-MEMORY_VERSION = 4
+MEMORY_VERSION = 6
+TRAINING_RAW_INDEX_COLUMN = "_TRAINING_RAW_INDEX"
 
 COMPANY_WORDS = {
     "verslun", "solur", "soluturn", "kiosk", "bakari", "bakarameistarinn",
@@ -100,6 +110,12 @@ RESTAURANT_SUPERMARKET_EXCLUDE_KEYWORDS = {
 
 GAS_STATION_KEYWORDS = {
     "n1", "olis", "orkan", "atlantsolia", "bensin", "bensinstod",
+}
+
+VEHICLE_EXPENSE_ACCOUNT_CODES = {"4635", "4640"}
+RAW_DETERMINISTIC_CONFIDENCE_SOURCES = {
+    "hardcoded_bank_signal",
+    "hardcoded_collection_cost",
 }
 
 
@@ -302,6 +318,60 @@ def clean_code(value) -> str:
     except (InvalidOperation, ValueError):
         text = re.sub(r"\.0$", "", text)
     return text if CODE_PATTERN.match(text) else ""
+
+
+def _existing_confidence_value(row):
+    for column in ("CONFIDENCE", "Cnf"):
+        try:
+            value = row.get(column, "")
+        except Exception:
+            value = ""
+        if not is_missing_value(value):
+            return value
+    return ""
+
+
+def _existing_debit_is_protected(row, overwrite_existing: bool) -> bool:
+    """Protect manual/nonblank work before any deterministic pre-pass."""
+    try:
+        existing = clean_code(row.get("DEBIT"))
+        marker = str(_existing_confidence_value(row) or "").strip().upper()
+        source = str(row.get("_AUTO_CODE_SOURCE", "") or "").strip().lower()
+    except Exception:
+        return False
+    if not existing:
+        return False
+    if marker in {"AD", "MN"} or source == "manual_review" or source.startswith("hardcoded_"):
+        return True
+    return not overwrite_existing
+
+
+def _apply_vehicle_expense_code_choice(
+    result: AutoCodeResult,
+    selected_code,
+) -> AutoCodeResult:
+    """Normalize only automatically predicted 4635/4640 vehicle expenses."""
+    target_code = clean_code(selected_code)
+    predicted_code = clean_code(result.code)
+    if (
+        target_code not in VEHICLE_EXPENSE_ACCOUNT_CODES
+        or predicted_code not in VEHICLE_EXPENSE_ACCOUNT_CODES
+        or predicted_code == target_code
+    ):
+        return result
+
+    result.code = target_code
+    note = f"vehicle expense account selected: {target_code}"
+    if note not in result.reason:
+        result.reason = f"{result.reason}; {note}" if result.reason else note
+    return result
+
+
+def _output_confidence(result: AutoCodeResult):
+    """Use AD only when a deterministic rule was proven by raw bank text."""
+    if result.source in RAW_DETERMINISTIC_CONFIDENCE_SOURCES:
+        return "AD"
+    return result.confidence if result.confidence else ""
 
 
 def _parse_amount(value):
@@ -630,6 +700,77 @@ def _confidence_from_history(count: int, total: int, ratio: float, exact: bool) 
     return max(0, min(99, base + count_boost + ratio_boost - ambiguity_penalty))
 
 
+def _hardcoded_bank_signal_rule(text: str, signal_text: str) -> AutoCodeResult | None:
+    """Return mandatory account codes for narrowly scoped bank explanations."""
+    combined = " ".join((normalize_text(text), normalize_text(signal_text))).strip()
+    if "rikissjodsinnheimt" not in combined:
+        return None
+
+    rules = (
+        (("gjold utan stadgreidslu", "gjald utan stadgreidslu"), "9610", "treasury non-withholding levy rule"),
+        (("kilometragjald", "kilometrjagjald"), "4610", "treasury kilometre fee rule"),
+        (("bifreidagjold", "bifreidagjald"), "4610", "treasury vehicle fee rule"),
+        (("gr frestur adflutningsgjalda", "greidslufrestur adflutningsgjalda"), "9540", "treasury deferred import fee rule"),
+        (("tryggingagjald",), "9615", "treasury insurance levy rule"),
+        (("stadgreidsluskattur",), "9615", "treasury withholding tax rule"),
+        (("kostnadur",), "6220", "treasury collection cost rule"),
+    )
+    for phrases, code, reason in rules:
+        if any(phrase in combined for phrase in phrases):
+            return AutoCodeResult(
+                code=code,
+                confidence=100,
+                status="coded",
+                reason=reason,
+                source="hardcoded_bank_signal",
+            )
+    return None
+
+
+def _cap_unrecognized_treasury_confidence(
+    result: AutoCodeResult,
+    text: str,
+    signal_text: str,
+) -> AutoCodeResult:
+    """Keep unfamiliar treasury explanations from appearing fully certain."""
+    combined = " ".join((normalize_text(text), normalize_text(signal_text))).strip()
+    if "rikissjodsinnheimt" not in combined:
+        return result
+    if _hardcoded_bank_signal_rule(text, signal_text) is not None:
+        return result
+    try:
+        confidence = int(result.confidence or 0)
+    except (TypeError, ValueError):
+        confidence = 0
+    if confidence > 70:
+        result.confidence = 70
+        note = "unrecognized treasury explanation confidence cap"
+        if note not in result.reason:
+            result.reason = f"{result.reason}; {note}" if result.reason else note
+    return result
+
+
+def _is_explicit_collection_cost_signal(text: str) -> bool:
+    """Recognize unambiguous collection-cost wording used by bank exports."""
+    normalized = normalize_text(text)
+    if "kostnadur" not in normalized:
+        return False
+    return "innheimt" in normalized or "krof" in normalized
+
+
+def _collection_cost_context_rule(context_flags=None) -> AutoCodeResult | None:
+    flags = set(context_flags or ())
+    if "explicit_collection_cost" in flags:
+        return AutoCodeResult(
+            code="6220",
+            confidence=100,
+            status="coded",
+            reason="explicit raw bank collection-cost rule",
+            source="hardcoded_collection_cost",
+        )
+    return None
+
+
 def _category_rule(
     text: str,
     signal_text: str,
@@ -643,6 +784,10 @@ def _category_rule(
     flags = set(context_flags or ())
     amount_value = _parse_amount(amount)
     abs_amount = abs(amount_value) if amount_value is not None else None
+
+    collection_cost_rule = _collection_cost_context_rule(flags)
+    if collection_cost_rule:
+        return collection_cost_rule
 
     if "simgreidsla" in combined:
         return AutoCodeResult(
@@ -663,16 +808,7 @@ def _category_rule(
                 source="amount_rule",
             )
 
-    if "paired_small_amount" in flags:
-        return AutoCodeResult(
-            code="6220",
-            confidence=100,
-            status="coded",
-            reason="same-day small paired amount rule",
-            source="amount_rule",
-        )
-
-    if "innheimtukrafa" in combined and "kostnadur" in combined:
+    if _is_explicit_collection_cost_signal(combined):
         return AutoCodeResult(
             code="6220",
             confidence=96,
@@ -726,15 +862,164 @@ def _source_signal_text(source_row) -> str:
     if source_row is None:
         return ""
     parts = []
+    seen_columns = set()
+    seen_values = set()
+
+    def append_value(value):
+        if is_missing_value(value):
+            return
+        value_text = str(value).strip()
+        if not value_text:
+            return
+        value_key = value_text.casefold()
+        if value_key in seen_values:
+            return
+        seen_values.add(value_key)
+        parts.append(value_text)
+
     for col in TEXT_SIGNAL_COLUMNS:
         try:
             value = source_row.get(col)
         except Exception:
             continue
-        if is_missing_value(value):
+        if value is None:
             continue
-        parts.append(str(value))
+        seen_columns.add(col)
+        append_value(value)
+
     return " | ".join(parts)
+
+
+def _source_rule_text(source_row) -> str:
+    """Collect all textual raw cells for deterministic cross-bank rules."""
+    if source_row is None:
+        return ""
+    signal_text = _source_signal_text(source_row)
+    parts = [signal_text] if signal_text else []
+    seen_columns = set(TEXT_SIGNAL_COLUMNS)
+    seen_values = {signal_text.casefold()} if signal_text else set()
+
+    # Bank exports do not use one stable name for merchant and explanation
+    # fields. Deterministic rules can safely inspect every textual cell while
+    # the learned coder continues to receive only the curated signal columns.
+    try:
+        source_items = source_row.items()
+    except Exception:
+        source_items = ()
+    for col, value in source_items:
+        if col in seen_columns or not isinstance(value, str):
+            continue
+        value_text = value.strip()
+        if not value_text:
+            continue
+        value_key = value_text.casefold()
+        if value_key in seen_values:
+            continue
+        seen_values.add(value_key)
+        parts.append(value_text)
+    return " | ".join(parts)
+
+
+def _source_collection_cost_kind(source_row) -> str:
+    """Return ``explicit`` or ``bare`` for known cross-bank cost signals."""
+    if source_row is None:
+        return ""
+    if _is_explicit_collection_cost_signal(_source_rule_text(source_row)):
+        return "explicit"
+    try:
+        source_items = source_row.items()
+    except Exception:
+        source_items = ()
+    for _column, value in source_items:
+        if not isinstance(value, str):
+            continue
+        if normalize_text(value).strip() == "kostnadur":
+            return "bare"
+    return ""
+
+
+def _normalized_column_key(value) -> str:
+    return re.sub(r"[^a-z0-9]", "", normalize_text(value))
+
+
+def _canonical_pair_reference(value) -> str:
+    if is_missing_value(value):
+        return ""
+    text = str(value).strip()
+    text = re.sub(r"^(\d+)\.0+$", r"\1", text)
+    return re.sub(r"[^a-z0-9]", "", normalize_text(text))
+
+
+def _source_pair_reference(source_row) -> str:
+    """Read a claim/reference key without confusing a kennitala for one."""
+    if source_row is None:
+        return ""
+    try:
+        source_items = list(source_row.items())
+    except Exception:
+        return ""
+
+    for column, value in source_items:
+        if _normalized_column_key(column) in PAIR_REFERENCE_COLUMN_KEYS:
+            reference = _canonical_pair_reference(value)
+            if reference:
+                return reference
+
+    # New seven-column Islandsbanki statements use Tilvísun as the claim key.
+    # Legacy exports use that column for the payee kennitala, so accept it only
+    # when it differs from the workbook's dedicated kennitala value.
+    kennitala_values = {
+        re.sub(r"\D", "", re.sub(r"^(\d+)\.0+$", r"\1", str(value).strip()))
+        for column, value in source_items
+        if "kennitala" in _normalized_column_key(column) and not is_missing_value(value)
+    }
+    for column, value in source_items:
+        if _normalized_column_key(column) != "tilvisun":
+            continue
+        reference = _canonical_pair_reference(value)
+        reference_digits = re.sub(r"\D", "", reference)
+        if reference and kennitala_values and reference_digits not in kennitala_values:
+            return reference
+    return ""
+
+
+def _source_row_for_output(source_df, output_row, output_index):
+    if source_df is None:
+        return None
+
+    candidates = []
+    try:
+        raw_index = output_row.get(TRAINING_RAW_INDEX_COLUMN)
+    except Exception:
+        raw_index = None
+    if not is_missing_value(raw_index):
+        candidates.append(raw_index)
+        try:
+            raw_index_number = float(raw_index)
+            if raw_index_number.is_integer():
+                candidates.append(int(raw_index_number))
+        except Exception:
+            pass
+    candidates.append(output_index)
+
+    checked = set()
+    for candidate in candidates:
+        try:
+            candidate_key = (type(candidate), candidate)
+            if candidate_key in checked:
+                continue
+            checked.add(candidate_key)
+        except Exception:
+            pass
+        try:
+            return source_df.loc[candidate]
+        except Exception:
+            continue
+
+    try:
+        return source_df.iloc[output_index]
+    except Exception:
+        return None
 
 
 def _is_outgoing_row(row, amount=None) -> bool:
@@ -745,39 +1030,71 @@ def _is_outgoing_row(row, amount=None) -> bool:
     return sign == "" and amount_value is not None and amount_value < 0
 
 
-def _row_context_flags(df: pd.DataFrame) -> dict[object, set[str]]:
+def _row_context_flags(
+    df: pd.DataFrame,
+    source_df: pd.DataFrame | None = None,
+) -> dict[object, set[str]]:
     flags: dict[object, set[str]] = defaultdict(set)
-    grouped: dict[tuple[str, str], list[tuple[object, Decimal]]] = defaultdict(list)
+    grouped: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
 
     for idx, row in df.iterrows():
         amount = _parse_amount(row.get("AMOUNT"))
         if amount is None or not _is_outgoing_row(row, amount):
             continue
-        key = merchant_key(row.get("TEXT", ""))
-        if not key:
+        source_row = _source_row_for_output(source_df, row, idx)
+        cost_kind = _source_collection_cost_kind(source_row)
+        if cost_kind == "explicit":
+            # The wording itself is decisive and must outrank merchant memory.
+            flags[idx].add("explicit_collection_cost")
+        id_text = re.sub(r"^(\d+)\.0+$", r"\1", str(row.get("ID", "") or "").strip())
+        id_digits = re.sub(r"\D", "", id_text)
+        identity = f"id:{id_digits}" if id_digits else f"text:{merchant_key(row.get('TEXT', ''))}"
+        if identity in {"id:", "text:"}:
             continue
         date_key = str(row.get("DATE", "")).strip()
         if not date_key:
             continue
-        grouped[(date_key, key)].append((idx, abs(amount)))
+        grouped[(date_key, identity)].append({
+            "idx": idx,
+            "reference": _source_pair_reference(source_row),
+            "cost_kind": cost_kind,
+        })
 
+    # Some new bank exports provide only the bare value "Kostnaður". Treat it
+    # as collection cost only when another outgoing row shares its claim key.
+    # Partitioning by reference keeps 3/4/6-row dates from contaminating one
+    # another and deliberately avoids inferring 6220 from amount alone.
     for rows in grouped.values():
-        if len(rows) < 2:
-            continue
-        max_amount = max(amount for _, amount in rows)
-        if max_amount < Decimal("25000"):
-            continue
-        small_limit = min(Decimal("7500"), max_amount * Decimal("0.10"))
-        for idx, amount in rows:
-            if amount > 0 and amount <= small_limit:
-                flags[idx].add("paired_small_amount")
+        by_reference: dict[str, list[dict[str, object]]] = defaultdict(list)
+        for record in rows:
+            reference = str(record["reference"] or "")
+            if reference:
+                by_reference[reference].append(record)
+        for reference_rows in by_reference.values():
+            if len(reference_rows) < 2:
+                continue
+            for record in reference_rows:
+                if record["cost_kind"] == "bare":
+                    flags[record["idx"]].add("explicit_collection_cost")
     return flags
 
 
 class TransactionAutoCoder:
-    def __init__(self, training_dir=None, key_dir=None, memory_path=None, force_rebuild: bool = False):
+    def __init__(
+        self,
+        training_dir=None,
+        key_dir=None,
+        memory_path=None,
+        training_data_dir=None,
+        force_rebuild: bool = False,
+    ):
         base = _base_dir()
         self.training_dir = Path(training_dir) if training_dir else base / "trainingCoded"
+        self.training_data_dir = (
+            Path(training_data_dir)
+            if training_data_dir
+            else self._resolve_training_data_dir(base)
+        )
         self.key_dir = self._resolve_key_dir(key_dir, base)
         self.memory_path = Path(memory_path) if memory_path else self.training_dir / MEMORY_FILENAME
         self.global_exact: dict[str, Counter] = defaultdict(Counter)
@@ -797,6 +1114,33 @@ class TransactionAutoCoder:
         self.memory_saved = False
         self.load(force_rebuild=force_rebuild)
 
+    def _reset_model(self):
+        self.global_exact = defaultdict(Counter)
+        self.global_family = defaultdict(Counter)
+        self.client_exact = defaultdict(Counter)
+        self.client_family = defaultdict(Counter)
+        self.context_counts = defaultdict(Counter)
+        self.client_context_counts = defaultdict(Counter)
+        self.token_counts = defaultdict(Counter)
+        self.bigram_counts = defaultdict(Counter)
+        self.code_counts = Counter()
+        self.account_descriptions = {}
+        self.training_rows = 0
+        self.training_files = 0
+        self.source_fingerprint = {}
+        self.loaded_from_memory = False
+        self.memory_saved = False
+
+    def _resolve_training_data_dir(self, base: Path) -> Path:
+        candidates = [
+            self.training_dir.parent / "trainingData",
+            base / "trainingData",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+
     def _resolve_key_dir(self, key_dir, base: Path) -> Path:
         candidates = []
         if key_dir:
@@ -814,24 +1158,26 @@ class TransactionAutoCoder:
         return candidates[0] if candidates else base / "coded keys"
 
     def load(self, force_rebuild: bool = False):
-        if not force_rebuild and self._load_memory_if_current():
+        # Normal auto-coding uses the saved model. Only the explicit rebuild
+        # action re-reads training workbooks, so a newly exported/unreviewed
+        # file cannot silently become training data during an ordinary run.
+        if not force_rebuild and self._load_memory():
             self.loaded_from_memory = True
             return
-        if force_rebuild:
-            self._load_existing_memory_for_merge()
+
+        # A rebuild always starts empty and never merges the previous JSON.
+        self._reset_model()
         self.account_descriptions.update(self._load_account_descriptions())
-        if not self.training_dir.exists():
+        training_sources = self._training_table_sources()
+        if not training_sources:
             self.save_memory()
             return
-        known_sources = dict(self.source_fingerprint)
-        for path in sorted(self.training_dir.rglob("*.xls*")):
+        for path in training_sources:
             if path.name.startswith("~$"):
                 continue
             source_key, source_meta = self._source_fingerprint_for_path(path)
-            if force_rebuild and source_key in known_sources and known_sources[source_key] == source_meta:
-                continue
             try:
-                df = pd.read_excel(path)
+                df = self._read_training_table(path)
             except Exception:
                 continue
             self.training_files += 1
@@ -884,13 +1230,19 @@ class TransactionAutoCoder:
 
     def _training_sources(self) -> list[Path]:
         paths = []
-        paths.extend(self._training_excel_sources())
+        paths.extend(self._training_table_sources())
         if self.key_dir.exists():
             paths.extend(
                 p for p in self.key_dir.rglob("*")
                 if p.is_file() and not p.name.startswith("~$")
             )
         return paths
+
+    def _training_table_sources(self) -> list[Path]:
+        sources = []
+        sources.extend(self._training_excel_sources())
+        sources.extend(self._training_archive_sources())
+        return sorted(dict.fromkeys(sources), key=lambda path: str(path).lower())
 
     def _training_excel_sources(self) -> list[Path]:
         if not self.training_dir.exists():
@@ -899,6 +1251,65 @@ class TransactionAutoCoder:
             p for p in self.training_dir.rglob("*.xls*")
             if p.is_file() and not p.name.startswith("~$")
         ]
+
+    def _training_archive_sources(self) -> list[Path]:
+        imports_root = self.training_data_dir / "imports"
+        if not imports_root.is_dir():
+            return []
+        session_dirs = set()
+        session_dirs.update(path.parent for path in imports_root.rglob("manifest.json"))
+        session_dirs.update(path for path in imports_root.iterdir() if path.is_dir())
+
+        sources = []
+        for session_dir in sorted(session_dirs, key=lambda path: str(path).lower()):
+            coded_path = self._session_coded_workbook(session_dir)
+            if coded_path is not None:
+                sources.append(coded_path)
+        return sources
+
+    def _session_coded_workbook(self, session_dir: Path) -> Path | None:
+        manifest_path = session_dir / "manifest.json"
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except Exception:
+            manifest = {}
+
+        names = [
+            manifest.get("archive_files", {}).get("coded") if isinstance(manifest, dict) else None,
+            manifest.get("output_coded_filename") if isinstance(manifest, dict) else None,
+        ]
+        for name in names:
+            if not name:
+                continue
+            candidate = session_dir / Path(str(name)).name
+            if candidate.is_file() and candidate.suffix.lower() in {".xlsx", ".xls", ".xlsm"}:
+                return candidate
+
+        # A manifest explicitly names the coded workbook. If that workbook was
+        # deleted, the session must disappear from the next clean rebuild; do
+        # not fall back to paired_rows.csv, raw.xlsx, or a combined workbook.
+        if any(names):
+            return None
+
+        candidates = [
+            path
+            for path in session_dir.glob("*.xls*")
+            if path.is_file()
+            and not path.name.startswith("~$")
+            and path.name.lower() != "raw.xlsx"
+            and "compressed_txs" not in path.stem.lower()
+        ]
+        coded_named = [path for path in candidates if path.stem.lower().endswith("_coded")]
+        if not coded_named:
+            return None
+        return max(coded_named, key=lambda path: path.stat().st_mtime)
+
+    def _read_training_table(self, path: Path) -> pd.DataFrame:
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            return pd.read_csv(path, dtype=object, keep_default_na=False, encoding="utf-8-sig")
+        return pd.read_excel(path, dtype=object, keep_default_na=False)
 
     def _source_fingerprint_for_path(self, path: Path) -> tuple[str, dict[str, int]]:
         try:
@@ -909,10 +1320,19 @@ class TransactionAutoCoder:
             rel = str(path.resolve().relative_to(_base_dir().resolve()))
         except Exception:
             rel = str(path.resolve())
-        return rel, {
+        metadata = {
             "mtime_ns": int(stat.st_mtime_ns),
             "size": int(stat.st_size),
         }
+        sync_error_path = path.parent / "paired_rows_sync_error.txt"
+        if path.parent.parent.name == "imports" and sync_error_path.exists():
+            try:
+                error_stat = sync_error_path.stat()
+                metadata["sync_error_mtime_ns"] = int(error_stat.st_mtime_ns)
+                metadata["sync_error_size"] = int(error_stat.st_size)
+            except OSError:
+                pass
+        return rel, metadata
 
     def _source_fingerprint(self, include_excel: bool = True) -> dict[str, dict[str, int]]:
         fingerprint = {}
@@ -981,6 +1401,7 @@ class TransactionAutoCoder:
         return {
             "version": MEMORY_VERSION,
             "training_dir": self._portable_path(self.training_dir),
+            "training_data_dir": self._portable_path(self.training_data_dir),
             "key_dir": self._portable_path(self.key_dir),
             "source_fingerprint": dict(self.source_fingerprint) or self._source_fingerprint(),
             "training_rows": int(self.training_rows),
@@ -1017,15 +1438,21 @@ class TransactionAutoCoder:
         }
         self.source_fingerprint = {
             str(key): {
-                "mtime_ns": int((value or {}).get("mtime_ns", 0) or 0),
-                "size": int((value or {}).get("size", 0) or 0),
+                str(meta_key): int(meta_value or 0)
+                for meta_key, meta_value in (value or {}).items()
+                if str(meta_key) in {
+                    "mtime_ns",
+                    "size",
+                    "sync_error_mtime_ns",
+                    "sync_error_size",
+                }
             }
             for key, value in (payload.get("source_fingerprint") or {}).items()
             if isinstance(value, dict)
         }
         return True
 
-    def _load_memory_if_current(self) -> bool:
+    def _load_memory(self) -> bool:
         if not self.memory_path.exists():
             return False
         try:
@@ -1035,30 +1462,31 @@ class TransactionAutoCoder:
             return False
         return self._load_payload(payload)
 
-    def _load_existing_memory_for_merge(self) -> bool:
-        if not self.memory_path.exists():
-            return False
-        try:
-            with open(self.memory_path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except Exception:
-            return False
-        if self._load_payload(payload):
-            self.loaded_from_memory = True
-            return True
-        return False
-
     def save_memory(self) -> bool:
-        if not self.ready():
-            return False
+        temp_path = self.memory_path.with_name(
+            f".{self.memory_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
         try:
             self.memory_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.memory_path, "w", encoding="utf-8") as handle:
-                json.dump(self._to_payload(), handle, ensure_ascii=False, indent=2)
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    self._to_payload(),
+                    handle,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.memory_path)
             self.memory_saved = True
             return True
         except Exception:
             return False
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _target_from_training_row(self, row) -> str:
         debit = clean_code(row.get("DEBIT"))
@@ -1183,6 +1611,16 @@ class TransactionAutoCoder:
         family = merchant_family(text)
         client = client_key_from_path(client_hint) if client_hint else ""
         person_like = looks_like_person_name(text) or looks_like_person_id(id_value)
+
+        mandatory_rule = _hardcoded_bank_signal_rule(str(text or ""), signal_text)
+        if mandatory_rule:
+            mandatory_rule.matched_text = key
+            if mandatory_rule.code in self.account_descriptions:
+                mandatory_rule.reason = (
+                    f"{mandatory_rule.reason}; "
+                    f"{mandatory_rule.code} {self.account_descriptions[mandatory_rule.code]}"
+                )
+            return mandatory_rule
 
         candidates: list[AutoCodeResult] = []
 
@@ -1518,6 +1956,7 @@ def get_auto_coder(
     training_dir=None,
     key_dir=None,
     memory_path=None,
+    training_data_dir=None,
     force_rebuild: bool = False,
 ) -> TransactionAutoCoder:
     global _CACHED_CODER, _CACHED_CODER_KEY
@@ -1525,12 +1964,14 @@ def get_auto_coder(
         str(Path(training_dir).resolve()) if training_dir else "",
         str(Path(key_dir).resolve()) if key_dir else "",
         str(Path(memory_path).resolve()) if memory_path else "",
+        str(Path(training_data_dir).resolve()) if training_data_dir else "",
     )
     if force_reload or force_rebuild or _CACHED_CODER is None or _CACHED_CODER_KEY != cache_key:
         _CACHED_CODER = TransactionAutoCoder(
             training_dir=training_dir,
             key_dir=key_dir,
             memory_path=memory_path,
+            training_data_dir=training_data_dir,
             force_rebuild=force_rebuild,
         )
         _CACHED_CODER_KEY = cache_key
@@ -1547,7 +1988,9 @@ def apply_auto_debit_codes(
     training_dir=None,
     key_dir=None,
     memory_path=None,
+    training_data_dir=None,
     industry_context: str = "",
+    vehicle_expense_code: str = "",
 ) -> pd.DataFrame:
     df = output_df.copy()
     if not enabled:
@@ -1556,11 +1999,58 @@ def apply_auto_debit_codes(
         df["_AUTO_CODE_SOURCE"] = "disabled"
         return df
 
-    coder = get_auto_coder(training_dir=training_dir, key_dir=key_dir, memory_path=memory_path)
+    context_flags_by_index = _row_context_flags(df, source_df=source_df)
+    mandatory_results = {}
+    for idx, row in df.iterrows():
+        amount = _parse_amount(row.get("AMOUNT"))
+        if not _is_outgoing_row(row, amount):
+            continue
+        if _existing_debit_is_protected(row, overwrite_existing):
+            continue
+        source_row = _source_row_for_output(source_df, row, idx)
+        mandatory = _hardcoded_bank_signal_rule(
+            str(row.get("TEXT", "") or ""),
+            _source_rule_text(source_row),
+        )
+        if mandatory is None:
+            mandatory = _collection_cost_context_rule(context_flags_by_index.get(idx, set()))
+        if mandatory:
+            df.at[idx, "DEBIT"] = mandatory.code
+            mandatory_results[idx] = mandatory
+
+    coder = get_auto_coder(
+        training_dir=training_dir,
+        key_dir=key_dir,
+        memory_path=memory_path,
+        training_data_dir=training_data_dir,
+    )
     if not coder.ready():
-        df["STATUS"] = "review needed"
-        df["CONFIDENCE"] = ""
-        df["_AUTO_CODE_SOURCE"] = "unavailable"
+        statuses = []
+        confidences = []
+        sources = []
+        for idx, row in df.iterrows():
+            if idx in mandatory_results:
+                mandatory = mandatory_results[idx]
+                statuses.append("coded")
+                confidences.append(_output_confidence(mandatory))
+                sources.append(mandatory.source)
+            elif _existing_debit_is_protected(row, overwrite_existing):
+                marker = _existing_confidence_value(row)
+                source = str(row.get("_AUTO_CODE_SOURCE", "") or "").strip()
+                statuses.append(str(row.get("STATUS", "") or "coded"))
+                confidences.append(marker)
+                sources.append(source or ("manual_review" if str(marker).upper() == "MN" else "existing"))
+            elif _is_outgoing_row(row):
+                statuses.append("review needed")
+                confidences.append("")
+                sources.append("unavailable")
+            else:
+                statuses.append("")
+                confidences.append("")
+                sources.append("")
+        df["STATUS"] = statuses
+        df["CONFIDENCE"] = confidences
+        df["_AUTO_CODE_SOURCE"] = sources
         return df
 
     repeat_counts = Counter()
@@ -1572,7 +2062,6 @@ def apply_auto_debit_codes(
         if key:
             repeat_counts[key] += 1
 
-    context_flags_by_index = _row_context_flags(df)
     statuses = []
     confidences = []
     sources = []
@@ -1588,22 +2077,23 @@ def apply_auto_debit_codes(
                 sources.append("")
                 continue
 
-        existing = clean_code(row.get("DEBIT"))
-        if existing and not overwrite_existing:
+        if idx in mandatory_results:
+            mandatory = mandatory_results[idx]
             statuses.append("coded")
-            confidences.append("")
-            sources.append("existing")
+            confidences.append(_output_confidence(mandatory))
+            sources.append(mandatory.source)
             continue
 
-        source_row = None
-        if source_df is not None:
-            try:
-                source_row = source_df.loc[idx]
-            except Exception:
-                try:
-                    source_row = source_df.iloc[idx]
-                except Exception:
-                    source_row = None
+        existing = clean_code(row.get("DEBIT"))
+        if existing and _existing_debit_is_protected(row, overwrite_existing):
+            marker = _existing_confidence_value(row)
+            source = str(row.get("_AUTO_CODE_SOURCE", "") or "").strip()
+            statuses.append(str(row.get("STATUS", "") or "coded"))
+            confidences.append(marker)
+            sources.append(source or ("manual_review" if str(marker).upper() == "MN" else "existing"))
+            continue
+
+        source_row = _source_row_for_output(source_df, row, idx)
         signal_text = _source_signal_text(source_row)
         text_value = row.get("TEXT", "")
         result = coder.predict(
@@ -1617,6 +2107,12 @@ def apply_auto_debit_codes(
             industry_context=industry_context,
             context_flags=context_flags_by_index.get(idx, set()),
         )
+        result = _cap_unrecognized_treasury_confidence(
+            result,
+            str(text_value or ""),
+            _source_rule_text(source_row),
+        )
+        result = _apply_vehicle_expense_code_choice(result, vehicle_expense_code)
         should_fill = result.code and (result.confidence >= fill_threshold or result.source == "fallback")
         if should_fill:
             df.at[idx, "DEBIT"] = result.code
@@ -1628,7 +2124,7 @@ def apply_auto_debit_codes(
             statuses.append("review needed")
         else:
             statuses.append("review needed")
-        confidences.append(result.confidence if result.confidence else "")
+        confidences.append(_output_confidence(result))
         sources.append(result.source or "")
 
     df["STATUS"] = statuses

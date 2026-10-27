@@ -8,8 +8,10 @@ venv/
 
 # Build artifacts
 build/
+build_*/
 dist/
 dist_*/
+artifacts/
 *.egg-info/
 
 # Local app/runtime output
@@ -17,12 +19,25 @@ dist_*/
 *.backup.py
 tok/trainingCoded/
 tok/trainingRaw/
+tok/trainingData/
 tok/special cases do not touch/
+
+# Training/import data at any repository level
+trainingCoded/
+trainingRaw/
+trainingData/
+special cases do not touch/
 
 # Private source documents and exports
 *.xlsx
 *.xls
 *.xlsm
+*.csv
+*.jsonl
+*.parquet
+*.feather
+*.sqlite
+*.sqlite-*
 *.pdf
 *.zip
 

@@ -31,7 +31,7 @@ for source, target in (
 
 a = Analysis(
     ['tok\\TokTenging.py'],
-    pathex=[],
+    pathex=['tok'],
     binaries=binaries,
     datas=datas,
     hiddenimports=[
@@ -40,6 +40,19 @@ a = Analysis(
         'bank_detection',
         'bank_formatter',
         'bank_utils',
+        'coded_file_tools',
+        'email_downloader',
+        'folder_printer',
+        'ml_artifacts',
+        'ml_dataset',
+        'ml_evaluation',
+        'ml_features',
+        'ml_model',
+        'ml_runtime',
+        'ml_training',
+        'shareholder_registry',
+        'shareholder_registry_data',
+        'training_archive',
         'ui_components',
         'pypdf',
         'tkinterdnd2',

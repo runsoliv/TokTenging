@@ -44,8 +44,10 @@ def autofit_excel_columns(file_path):
         "orange": PatternFill(fill_type="solid", fgColor="F4B183"),
         "yellow": PatternFill(fill_type="solid", fgColor="FFFF00"),
         "green": PatternFill(fill_type="solid", fgColor="00B050"),
+        "light_blue": PatternFill(fill_type="solid", fgColor="00B0F0"),
+        "purple": PatternFill(fill_type="solid", fgColor="B4A7D6"),
     }
-    
+
     # Find special column indexes.
     date_col_idx = None
     confidence_col_idx = None
@@ -56,8 +58,13 @@ def autofit_excel_columns(file_path):
             confidence_col_idx = idx
 
     def confidence_fill(value):
+        text = str(value).strip().lower()
+        if text in {"mn", "manual"}:
+            return confidence_fills["light_blue"]
+        if text == "ad":
+            return confidence_fills["purple"]
         try:
-            confidence = int(float(str(value).strip()))
+            confidence = int(float(text))
         except Exception:
             return None
         if confidence < 50:
@@ -373,12 +380,23 @@ def _parse_innheimta_amount(val, force_thousands=False):
 def _format_kennitala(val):
     if pd.isna(val):
         return ''
-    text = str(val).strip()
-    if not text:
+    if isinstance(val, bool):
         return ''
-    text = text.replace(" ", "").replace("-", "")
-    text = text.replace(".", "")
-    return text
+    if isinstance(val, str):
+        text = val.strip()
+    else:
+        try:
+            number = Decimal(str(val))
+        except Exception:
+            return ''
+        if not number.is_finite() or number != number.to_integral_value():
+            return ''
+        text = str(int(number))
+    if re.fullmatch(r"\d{10}", text):
+        return text
+    if re.fullmatch(r"\d{6}-\d{4}", text):
+        return text.replace("-", "")
+    return ''
 
 
 
